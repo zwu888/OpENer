@@ -16,9 +16,13 @@ stay on the kernel socket stack.
   framing (`cipioconnection.c`), assembly data handling
   (`cipassembly.c`), and the connection state machine
   (`cipconnectionmanager.c`, `cipconnectionobject.c`).
-- Land as an additive, compile-time-selectable backend, not a fork of the
-  POSIX port — explicit messaging, discovery, and all non-Linux ports keep
-  working exactly as today when the feature is off.
+- Land as an additive backend, not a fork of the POSIX port — explicit
+  messaging, discovery, and all non-Linux ports keep working exactly as
+  today whether or not the feature is even compiled in. The kernel-socket
+  I/O backend is never replaced or removed: DPDK is an opt-in capability
+  compiled in via `OPENER_ENABLE_DPDK_DATAPATH` and switched on
+  per-process via a `--io-datapath` runtime flag (§5a), not a
+  compile-time-exclusive alternative to it.
 
 **Non-Goals (initial version)**
 
@@ -183,9 +187,10 @@ Key mechanics:
   `sk_buff` for it or delivers it to a bound socket. This means
   `CheckAndHandleConsumingUdpSocket()` (today's socket-based UDP:2222
   reader) simply stops receiving anything once the XDP program is loaded —
-  it becomes dead code under `OPENER_IO_DATAPATH=DPDK`, replaced by a poll
-  into `dpdk_io_datapath.c` (§6) rather than deleted outright, so the
-  SOCKET build path stays untouched.
+  which only happens when a process is actually started with
+  `--io-datapath=dpdk` (§5a). It stays fully compiled in and fully
+  functional; a `--io-datapath=socket` run on the identical binary never
+  loads the XDP program at all, so that function keeps receiving normally.
 - **The AF_XDP socket (`xsk`) is what DPDK's `net_af_xdp` PMD wraps** —
   `rte_eth_rx_burst`/`tx_burst` in `dpdk_io_datapath.c` (Thread B, §6)
   operate against this socket's shared-memory rings (`umem`), not against a
@@ -290,31 +295,77 @@ implementations (and the RX polling loop that used to be
 
 ## 5. Proposed module layout
 
+**Revised for runtime selection** (see §5a): the kernel-socket backend
+must stay fully present and working in every build, with DPDK as an
+opt-in switched on *at process start*, not baked in exclusively at
+compile time. That changes the module layout from a link-time swap to a
+runtime dispatch:
+
 ```
 source/src/ports/DPDK/
-  dpdk_io_datapath.c / .h     -- new module, built only when OPENER_IO_DATAPATH=DPDK
+  dpdk_io_datapath.c / .h     -- new module, compiled in whenever
+                                  OPENER_ENABLE_DPDK_DATAPATH=ON (build-time
+                                  toggle for "is DPDK support present at all"),
+                                  but only *active* if selected at runtime
   dpdk_arp.c / .h             -- minimal ARP responder + resolver (Option A only;
                                   not needed for Option B, kernel owns ARP)
-CMakeLists.txt                -- new OPENER_IO_DATAPATH option (SOCKET default | DPDK)
+CMakeLists.txt                -- new OPENER_ENABLE_DPDK_DATAPATH option (OFF default)
 ```
 
 `generic_networkhandler.c` keeps `CheckAndHandleTcpListenerSocket`,
 `HandleDataOnTcpSocket`, `CheckAndHandleUdpUnicastSocket`, and
 `CheckAndHandleUdpGlobalBroadcastSocket` exactly as-is — those stay on
-kernel sockets in both options. Only these two pieces get an
-`#ifdef`/link-time swap:
+kernel sockets always, regardless of which I/O backend is active. Its
+existing `SendUdpData()` and `CheckAndHandleConsumingUdpSocket()` also
+stay exactly as-is and **remain the default** — this is the important
+change from the original compile-time design: the socket backend is
+never replaced or removed, only bypassed when DPDK is selected.
 
-- `SendUdpData()` — when `OPENER_IO_DATAPATH=DPDK`, this symbol is
-  provided by `dpdk_io_datapath.c` instead of `generic_networkhandler.c`,
-  and it enqueues a pre-built mbuf onto a TX ring instead of calling
-  `sendto()`.
-- The consuming-socket poll (`CheckAndHandleConsumingUdpSocket`) is
-  replaced by a call into `dpdk_io_datapath.c`'s RX drain function from
-  the same cyclic tick, which calls the *same*
-  `HandleReceivedConnectedData()` the socket path calls today.
+Because both implementations now have to coexist in one binary, the
+original plan of `dpdk_io_datapath.c` providing a same-named `SendUdpData`
+symbol at link time no longer works (duplicate-symbol conflict). Instead:
 
-No new CIP-layer code, no change to assembly handling, no change to
-`ManageConnections()`'s cadence.
+- `dpdk_io_datapath.c` exposes its own distinctly-named entry points —
+  `DpdkSendUdpData()` and a `DpdkPollIoTraffic()` RX-drain function —
+  never `SendUdpData` itself.
+- A small dispatch layer (a couple of function pointers set once during
+  `NetworkHandlerInitialize()`, based on the runtime-selected backend —
+  see §5a) decides which implementation `SendConnectedData()` and the
+  cyclic tick actually call. When the socket backend is active (the
+  default), this dispatch is a direct call straight through to the
+  existing `SendUdpData`/`CheckAndHandleConsumingUdpSocket` — no added
+  indirection cost for the common case.
+
+### 5a. Runtime backend selection
+
+A CLI flag on the existing POSIX binary, e.g. `OpENer eno1
+--io-datapath=dpdk` (default: `--io-datapath=socket`, so an unmodified
+invocation behaves exactly as today), or equivalently an
+`OPENER_IO_DATAPATH=DPDK` environment variable — either is read once at
+startup in `main()`/`NetworkHandlerInitialize()`, before any sockets or
+DPDK EAL state are touched:
+
+- **`socket` (default)**: behaves identically to a build with DPDK support
+  compiled out entirely. If `OPENER_ENABLE_DPDK_DATAPATH=ON` was set at
+  build time, `dpdk_io_datapath.c`'s code is present in the binary but
+  never invoked — no EAL init, no hugepage reservation, no isolated-core
+  thread spawned, zero runtime cost paid for carrying the capability.
+- **`dpdk`**: `NetworkHandlerInitialize()` calls into `dpdk_io_datapath.c`
+  to run DPDK EAL init, bind/verify the target NIC or AF_XDP socket, and
+  spawn Thread B (§6) before entering the normal event loop. If this
+  build wasn't compiled with `OPENER_ENABLE_DPDK_DATAPATH=ON`, requesting
+  `dpdk` at runtime is a hard startup error (the capability genuinely
+  isn't in the binary) — the build-time flag controls whether the
+  *capability* exists, the runtime flag controls whether it's *used*.
+
+This means the same compiled binary (built once with
+`OPENER_ENABLE_DPDK_DATAPATH=ON`) can be deployed everywhere, and
+individual instances opt into DPDK only where the hardware/hugepage setup
+actually supports it — the kernel-socket path is never removed as an
+option, just not the one running on that particular invocation.
+
+No new CIP-layer code either way, no change to assembly handling, no
+change to `ManageConnections()`'s cadence.
 
 ## 6. Threading & timing model
 
@@ -329,7 +380,11 @@ blocks. Proposed model:
 - **Thread B (new)**: pinned to one isolated core, runs the DPDK RX/TX
   poll loop. On RX, it builds the `sockaddr_in` + payload exactly as
   `CheckAndHandleConsumingUdpSocket` does today and calls
-  `HandleReceivedConnectedData()` directly.
+  `HandleReceivedConnectedData()` directly. Per §5a, this thread is only
+  spawned — and EAL/hugepage/PMD init only attempted — when the process
+  was started with `--io-datapath=dpdk`. In the default `socket` mode,
+  Thread A is the only thread, exactly as today; there is no Thread B to
+  reason about at all.
 - **Cross-thread data**: `HandleReceivedConnectedData()` →
   `HandleReceivedIoConnectionData()` → `NotifyAssemblyConnectedDataReceived()`
   writes straight into the assembly's `CipByteArray`, same as it does
@@ -377,34 +432,47 @@ every header itself. Concretely:
 
 ## 8. Build integration
 
+Per §5a, this is now a *build-time capability toggle* rather than an
+exclusive backend choice — `OPENER_ENABLE_DPDK_DATAPATH=ON` compiles
+`dpdk_io_datapath.c` and links `libdpdk` in *alongside* the always-present
+socket backend, so the resulting binary supports both and chooses between
+them via the `--io-datapath` runtime flag:
+
 ```cmake
 # source/CMakeLists.txt (new option, POSIX platform only)
-set(OPENER_IO_DATAPATH "SOCKET" CACHE STRING "I/O (Class 0/1) datapath backend: SOCKET or DPDK")
-set_property(CACHE OPENER_IO_DATAPATH PROPERTY STRINGS SOCKET DPDK)
+option(OPENER_ENABLE_DPDK_DATAPATH "Compile in the optional DPDK I/O datapath backend (selected at runtime via --io-datapath)" OFF)
 
-if(OPENER_IO_DATAPATH STREQUAL "DPDK")
+if(OPENER_ENABLE_DPDK_DATAPATH)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(DPDK REQUIRED IMPORTED_TARGET libdpdk)
-  add_definitions(-DOPENER_IO_DATAPATH_DPDK)
+  add_definitions(-DOPENER_ENABLE_DPDK_DATAPATH)
+  target_sources(OpENer PRIVATE source/src/ports/DPDK/dpdk_io_datapath.c)
   target_link_libraries(OpENer PRIVATE PkgConfig::DPDK)
-  # dpdk_io_datapath.c replaces generic_networkhandler.c's SendUdpData
-  # and the consuming-UDP-socket branch of NetworkHandlerProcessCyclic.
+  # dpdk_io_datapath.c's DpdkSendUdpData()/DpdkPollIoTraffic() are wired
+  # into the dispatch layer (§5) alongside generic_networkhandler.c's
+  # existing SendUdpData()/CheckAndHandleConsumingUdpSocket() — neither
+  # replaces the other. --io-datapath at runtime picks which one runs.
 endif()
 ```
 
+When `OPENER_ENABLE_DPDK_DATAPATH=OFF` (the default), the binary behaves
+exactly as it does today — no DPDK dependency, no `--io-datapath=dpdk`
+option available, `libdpdk` isn't even required to be installed.
 `pkg-config libdpdk` already resolves correctly on this machine
-(`libdpdk-dev` 24.11.4 is installed), so this is a real, testable option
-here, not speculative.
+(`libdpdk-dev` 24.11.4 is installed), so `ON` is a real, testable option
+here too, not speculative.
 
 ## 9. Testing plan (once implemented)
 
 1. **Unit-level parity check**: point EIPScanner's `implicit_messaging`
-   example (already used in `EIPSCANNER_TESTING.md`) at an
-   `OPENER_IO_DATAPATH=SOCKET` build and an `OPENER_IO_DATAPATH=DPDK`
-   build in turn, from the *same* client, and diff the received T2O
-   byte sequences — they must be identical. This directly reuses the
-   pattern-mirroring test already built (`test_io_verify.cpp` /
-   `test_io_verify2.cpp` in that session's scratchpad).
+   example (already used in `EIPSCANNER_TESTING.md`) at the *same*
+   `OPENER_ENABLE_DPDK_DATAPATH=ON` binary run once with
+   `--io-datapath=socket` and once with `--io-datapath=dpdk`, from the
+   *same* client, and diff the received T2O byte sequences — they must be
+   identical. This directly reuses the pattern-mirroring test already
+   built (`test_io_verify.cpp` / `test_io_verify2.cpp` in that session's
+   scratchpad), and additionally confirms the runtime dispatch itself
+   picks the right backend rather than silently falling through to one.
 2. **Latency/jitter comparison**: capture T2O packet inter-arrival time
    distribution under both backends at a fixed RPI, to quantify the
    actual benefit before calling the migration worthwhile for a given
@@ -424,8 +492,17 @@ here, not speculative.
 - Where `ManageConnections()`/timer ownership for I/O connections ends up
   living (thread A vs thread B, §6) — affects whether any `rte_ring`
   handoff is needed at all.
-- Whether to support graceful fallback (run on `OPENER_IO_DATAPATH=SOCKET`
-  automatically if DPDK EAL init fails at startup, e.g. no hugepages
-  configured) or fail hard. Recommend fail hard initially — silent
-  fallback to a 10x-worse-jitter datapath is a worse failure mode for a
-  control system than refusing to start.
+- Whether `--io-datapath=dpdk` should *automatically* fall back to the
+  socket backend if DPDK EAL init fails at startup (e.g. no hugepages
+  configured), or fail hard. This question is easier to answer now that
+  the socket backend is always present in the binary either way (§5a) —
+  there's no longer a build that literally lacks a working fallback to
+  drop into — but the original concern still stands: **recommend fail
+  hard by default.** A caller that explicitly asked for the DPDK datapath
+  presumably did so for its latency guarantees; silently downgrading to a
+  10x-worse-jitter datapath without the operator noticing is a worse
+  failure mode for a control system than refusing to start. An opt-in
+  `--io-datapath=dpdk-or-socket` (explicit, named fallback mode) could be
+  added later for deployments that would rather degrade than not start,
+  but that should be a deliberate second flag, not the default behavior
+  of `--io-datapath=dpdk`.
