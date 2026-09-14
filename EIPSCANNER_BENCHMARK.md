@@ -194,9 +194,17 @@ built and rerun with `BenchmarkExample.cpp`.
    target_link_libraries(benchmark_example EIPScanner)
    ```
    then rebuild.
-4. Run: `./examples/benchmark_example <opener_ip> <rpi_us> <duration_s>`,
+4. Run: `./examples/benchmark_example <opener_ip> <rpi_us> <duration_s> [--io-datapath=socket|dpdk]`,
    e.g. `./examples/benchmark_example 192.168.1.154 10000 8` for a 10 ms RPI,
-   8-second run.
+   8-second run. The optional `--io-datapath` flag is a **reporting label
+   only** — this client can't select OpENer's I/O backend over the wire.
+   OpENer's own `--io-datapath` flag
+   (`DPDK_IO_DATAPATH_DESIGN.md` §5a, proposed, not yet implemented) is a
+   separate, server-side startup option; set it there when starting
+   OpENer, then pass the matching value here so each run's output is
+   self-labeled with which backend it was actually testing against — this
+   is what `DPDK_IO_DATAPATH_DESIGN.md` §9's parity-check methodology
+   needs once that flag exists.
 
 ## Source
 
