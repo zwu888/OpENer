@@ -47,7 +47,7 @@ this differently, and the design needs to name which one it targets:
 | **A. Dedicated NIC** | Explicit messaging + discovery stay on one NIC via the kernel; a *second*, otherwise-unused NIC (or SR-IOV VF) is bound to a DPDK PMD (`vfio-pci`/`uio_pci_generic`) purely for I/O traffic. | Simplest to implement and reason about. Requires two physically separate L2-reachable NICs/VFs, which many "small adapter" deployments won't have. |
 | **B. AF_XDP (shared NIC)** | One NIC stays under the kernel driver; an XDP program in the kernel redirects only UDP-port-2222 traffic into an `AF_XDP` socket, which DPDK's `net_af_xdp` PMD consumes in userspace. Everything else (ARP, ICMP, TCP 44818, discovery) flows through the kernel exactly as today. | No dedicated NIC needed; ARP/routing/multicast stay handled by the kernel for free. Lower ceiling than a fully dedicated PMD (still crosses into kernel once for the XDP redirect), but that's the right tradeoff for a device that also needs to keep talking TCP on the same wire. |
 
-**Recommendation:** build the transport-abstraction seam (Section 4) so
+**Recommendation:** build the transport-abstraction seam (Section 5) so
 it doesn't care which of the two is underneath, but implement and test
 against **Option B (AF_XDP)** first. It's deployable on the same single
 NIC as everything else — which matches how the existing OpENer sample
@@ -62,7 +62,86 @@ no kernel driver bound) usable for Option A experiments, and its active
 NICs (`eno1`, `enp21s0np0`) intentionally excluded from any binding — the
 box's own network access depends on them.
 
-## 3. Current architecture (for reference)
+## 3. Network topology
+
+Concrete topology for both options, using the hosts already in play for
+interop/benchmark testing (`EIPSCANNER_TESTING.md`,
+`EIPSCANNER_BENCHMARK.md`): the OpENer adapter at `192.168.1.154` and the
+EIPScanner test host "hp6z4" at `192.168.1.151`, both on the same
+`192.168.1.0/24` LAN segment today.
+
+### Option B — AF_XDP, single shared NIC (recommended first target)
+
+No topology change from what's tested today — one NIC, one cable, one
+switch port. The split happens inside the OpENer host, in software:
+
+```
+                    192.168.1.0/24 LAN (existing switch)
+                                 │
+              ┌──────────────────┴──────────────────┐
+              │                                      │
+   ┌──────────┴───────────┐              ┌───────────┴──────────┐
+   │  OpENer host           │              │  hp6z4 (EIPScanner)   │
+   │  eno1  192.168.1.154    │              │  192.168.1.151          │
+   │  (single NIC, kernel-    │              │  (ordinary kernel NIC,  │
+   │   owned, unchanged)       │              │   no DPDK needed here)   │
+   │                            │              └───────────────────────┘
+   │  ┌──────────────────────┐  │
+   │  │ Kernel network stack  │  │ ◀── TCP :44818  (explicit messaging)
+   │  │                        │  │ ◀── UDP :44818  (discovery, ARP, ICMP, SSH)
+   │  └───────────┬────────────┘  │
+   │              │ XDP program redirects
+   │              │ UDP dst-port 2222 only
+   │  ┌───────────┴────────────┐  │
+   │  │ AF_XDP socket            │  │ ◀── UDP :2222  (Class 0/1 cyclic I/O)
+   │  │  → net_af_xdp DPDK PMD    │  │
+   │  │  → dpdk_io_datapath.c     │  │
+   │  │    (Thread B, isolated    │  │
+   │  │     core, RX/TX poll loop)│  │
+   │  └────────────────────────────┘  │
+   └────────────────────────────────────┘
+```
+
+Everything not matching the XDP redirect filter (ARP, ICMP, TCP 44818, SSH,
+UDP 44818 discovery) falls through to the kernel exactly as it does on the
+current all-socket build — this is what makes Option B deployable on the
+same single-NIC box already in use for interop testing, with no cabling or
+switch-port changes.
+
+### Option A — dedicated NIC, separate L2 segment
+
+Requires a genuinely separate NIC (or SR-IOV VF) on **both** ends — the
+scanner/PLC side also needs a second port on the dedicated segment, since a
+DPDK-bound NIC no longer speaks ARP or answers on any other protocol:
+
+```
+        management LAN (192.168.1.0/24, existing switch)
+                          │
+   ┌──────────────────────┴──────────────────────┐
+   │                                              │
+┌──┴──────────────────────┐              ┌────────┴──────────────┐
+│ OpENer host               │              │ hp6z4 (mgmt / SSH)      │
+│ eno1  192.168.1.154        │              │ 192.168.1.151             │
+│ (kernel: TCP:44818,         │              └────────────────────────┘
+│  UDP:44818, SSH, ARP, ICMP) │
+└──┬──────────────────────────┘
+   │  second, otherwise-idle NIC — no kernel driver bound
+┌──┴──────────────────────┐     dedicated I/O-only L2 segment      ┌────────────────────────┐
+│ 0000:09:00.0 (X722)       │ ════════════════════════════════════▶│ Scanner/PLC I/O NIC      │
+│ DPDK PMD (vfio-pci)        │   direct cable, or its own switch/    │ (separate port from its   │
+│ dpdk_io_datapath.c          │   VLAN — UDP :2222 only, no ARP/       │  own management NIC)      │
+│ (Thread B, isolated core)    │   DHCP/SSH needed on this segment      │                           │
+└────────────────────────────┘                                    └────────────────────────┘
+```
+
+On this test machine, `0000:09:00.0` (an idle Intel X722 port, confirmed
+unbound via `dpdk-devbind.py --status`) is the concrete candidate for this
+role — see §2. Note this option isn't testable against hp6z4 as configured
+today, since hp6z4 only has its single management NIC on the shared LAN; it
+would need its own second, DPDK- or otherwise dedicated-port to become a
+real Option-A peer.
+
+## 4. Current architecture (for reference)
 
 ```
                  select() loop, generic_networkhandler.c
@@ -100,7 +179,7 @@ implementations (and the RX polling loop that used to be
 `CheckAndHandleConsumingUdpSocket`), without touching `cipioconnection.c`,
 `cipconnectionmanager.c`, or anything above them.
 
-## 4. Proposed module layout
+## 5. Proposed module layout
 
 ```
 source/src/ports/DPDK/
@@ -128,7 +207,7 @@ kernel sockets in both options. Only these two pieces get an
 No new CIP-layer code, no change to assembly handling, no change to
 `ManageConnections()`'s cadence.
 
-## 5. Threading & timing model
+## 6. Threading & timing model
 
 DPDK poll-mode RX (`rte_eth_rx_burst`) is a tight spin loop — it cannot
 share a thread with the `select()`-based explicit-messaging loop, which
@@ -164,7 +243,7 @@ blocks. Proposed model:
     what — flagged as an open question for the implementation phase, not
     settled by this doc).
 
-## 6. Packet construction
+## 7. Packet construction
 
 mbuf layout for a T2O (produced) packet is just today's `SendUdpData`
 payload wrapped in Ethernet/IP/UDP headers built by hand (`rte_ether_hdr`
@@ -187,7 +266,7 @@ every header itself. Concretely:
   than end-to-end integrity — flagged as an implementation-time choice,
   not a correctness requirement either way for a LAN-local control link.
 
-## 7. Build integration
+## 8. Build integration
 
 ```cmake
 # source/CMakeLists.txt (new option, POSIX platform only)
@@ -208,7 +287,7 @@ endif()
 (`libdpdk-dev` 24.11.4 is installed), so this is a real, testable option
 here, not speculative.
 
-## 8. Testing plan (once implemented)
+## 9. Testing plan (once implemented)
 
 1. **Unit-level parity check**: point EIPScanner's `implicit_messaging`
    example (already used in `EIPSCANNER_TESTING.md`) at an
@@ -229,12 +308,12 @@ here, not speculative.
    ownership doesn't change that if the *test client* is still a normal
    socket app on the same host reusing the same port.
 
-## 9. Open questions for implementation phase
+## 10. Open questions for implementation phase
 
 - Final choice between Option A and B (recommend starting with B, see
   §2).
 - Where `ManageConnections()`/timer ownership for I/O connections ends up
-  living (thread A vs thread B, §5) — affects whether any `rte_ring`
+  living (thread A vs thread B, §6) — affects whether any `rte_ring`
   handoff is needed at all.
 - Whether to support graceful fallback (run on `OPENER_IO_DATAPATH=SOCKET`
   automatically if DPDK EAL init fails at startup, e.g. no hugepages
