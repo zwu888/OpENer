@@ -108,6 +108,45 @@ doesn't align perfectly to whole RPI cycles.)
   ~98.5 Hz cyclic I/O with sub-2 ms true round-trip latency and zero packet
   loss over a real two-host network path.
 
+## Expected impact of the proposed DPDK refactor
+
+This benchmark's SOCKET-path numbers above are the baseline that
+[`DPDK_IO_DATAPATH_DESIGN.md`](DPDK_IO_DATAPATH_DESIGN.md)'s proposed
+refactor should be compared against (its own §9 Testing plan calls for
+exactly that: rerun this same benchmark against `OPENER_IO_DATAPATH=SOCKET`
+and `=DPDK` builds and diff the distributions). Since the refactor only
+replaces the RX/TX transport under `HandleReceivedConnectedData()` /
+`SendUdpData()` — none of the CIP/assembly/connection-manager logic this
+benchmark exercises changes — the realistic expectations are:
+
+**Expected to improve:**
+- **Jitter / tail latency (p99, max)** — the real target. `min` RTT above
+  stays a tight ~1.4-3.6 ms across every RPI (close to the true floor), but
+  `avg`/`p99`/`max` spread out badly as RPI grows (e.g. 100 ms RPI: p50=52 ms,
+  p99/max=296 ms). Much of that spread is kernel scheduling variance
+  (interrupt coalescing, `select()` wake-up granularity, syscall/copy
+  overhead) that a DPDK poll-mode driver on an isolated core should remove.
+- **Best-case single-packet latency** — should drop below the ~1.4 ms floor
+  measured here, since kernel network-stack traversal, context switches, and
+  `recvfrom`/`sendto` syscall overhead disappear from the datapath.
+
+**Not expected to improve on its own:**
+- **The 10 ms cyclic-rate floor** — set by
+  `kOpenerTimerTickInMilliSeconds=10` gating `ManageConnections()`, a config
+  constant unrelated to the kernel socket stack. DPDK alone doesn't touch
+  it; going faster than 10 ms also needs the open question in the design
+  doc's §6 (moving T2O production onto the DPDK thread's own tight poll
+  loop) resolved.
+- **Packet loss / reception ratio** — already ~100% on the socket path in
+  every run above, so there's no headroom to reclaim there.
+- **Explicit messaging or discovery** — explicitly out of scope for the
+  refactor, stays on kernel sockets either way.
+
+No DPDK-path numbers exist yet — the refactor is design-only
+(`DPDK_IO_DATAPATH_DESIGN.md` status: *Proposal / not yet implemented*).
+This section will be replaced with a real before/after comparison once it's
+built and rerun with `BenchmarkExample.cpp`.
+
 ## Reproducing
 
 1. Build OpENer for POSIX (`bin/posix/setup_posix.sh && make`) and run the
