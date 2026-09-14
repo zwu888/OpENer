@@ -84,13 +84,39 @@ RPI sweep, 8 seconds per run, EIPScanner (hp6z4) → OpENer (this host):
 
 | RPI requested | Cycles received | Reception ratio | Achieved rate | RTT min / p50 / p99 / max | Cycle jitter (mean abs) |
 |---|---|---|---|---|---|
+| 1 ms   | connection closed early (see below) | — | — | — | — |
+| 5 ms   | 788/1600 (vs. requested rate) | 49.2%\* | 98.5 Hz | 1.25 / 3.65 / 6.66 / 6.69 ms | 0.30 ms |
 | 10 ms  | 788/800 | 98.5%  | 98.5 Hz | 1.40 / 6.69 / 11.73 / 11.74 ms  | 0.39 ms |
 | 20 ms  | 401/400 | 100.2% | 50.1 Hz | 1.40 / 11.67 / 23.08 / 185.5 ms | 1.17 ms |
 | 50 ms  | 161/160 | 100.6% | 20.1 Hz | 1.45 / 31.02 / 166.1 / 206.8 ms | 2.05 ms |
 | 100 ms | 81/80   | 101.2% | 10.1 Hz | 3.61 / 52.25 / 295.7 / 295.7 ms | 3.77 ms |
 
 (Reception ratio occasionally exceeds 100% because the fixed test duration
-doesn't align perfectly to whole RPI cycles.)
+doesn't align perfectly to whole RPI cycles. \*At RPI=5ms, "reception
+ratio" is computed against the *requested* 5ms rate and looks like loss,
+but it isn't — see below.)
+
+### Below the floor: RPI=1ms and RPI=5ms
+
+Pushing the requested RPI below the ~10ms floor doesn't make OpENer produce
+faster — it exposes a second, independent floor: **EIPScanner scales its
+own client-side inactivity watchdog to the RPI you request.** At RPI=5ms,
+the watchdog window is still generous enough to tolerate the real ~10ms
+delivery cadence — the connection survives, and the achieved rate is
+identical to the RPI=10ms case (98.5 Hz, ~10.15ms cycle interval,
+essentially the same RTT distribution once you look at absolute numbers).
+At RPI=1ms, the watchdog window is too tight: it expires before OpENer's
+first real cycle can arrive, and EIPScanner closes the connection
+client-side with zero cycles received — calling `forwardClose()` on that
+already-dead connection originally crashed this benchmark with an assertion
+failure inside EIPScanner (`ConnectionManager.cpp:201`); the benchmark now
+detects `hasOpenConnections() == false` after the run loop and skips the
+redundant close, reporting `closed_early=true` instead of crashing.
+
+**Practical takeaway:** there is no way to observe a cyclic rate faster
+than ~10ms against this OpENer build by asking for a smaller RPI — you'll
+either get exactly the same ~10ms cadence (if the watchdog tolerates it) or
+no connection at all (if it doesn't).
 
 ### Observations
 
@@ -99,7 +125,9 @@ doesn't align perfectly to whole RPI cycles.)
   requested RPI closely (e.g. 10.15 ms avg at RPI=10ms), with jitter growing
   roughly linearly with RPI.
 - **10 ms confirmed as the practical floor**, consistent with the
-  `kOpenerTimerTickInMilliSeconds` analysis above.
+  `kOpenerTimerTickInMilliSeconds` analysis above -- and confirmed from the
+  other direction too: RPI=5ms still only achieves 98.5 Hz (~10.15ms
+  cadence), identical to RPI=10ms.
 - **True network RTT stays low and roughly constant** (~1.4-3.6 ms `min`)
   across all RPIs; the growth in avg/p99/max RTT with RPI reflects
   transmit-scheduling latency inherent to a slower cyclic rate, not network

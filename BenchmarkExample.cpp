@@ -134,11 +134,27 @@ int main(int argc, char **argv) {
     connectionManager.handleConnections(std::chrono::milliseconds(1));
   }
 
-  connectionManager.forwardClose(si, io);
+  // EIPScanner scales its own client-side inactivity watchdog to the
+  // requested RPI. If that RPI is below what the adapter can actually
+  // sustain (OpENer's floor is ~10ms, see EIPSCANNER_BENCHMARK.md), the
+  // watchdog fires and closes the connection client-side -- hasOpenConnections()
+  // goes false -- before the deadline. Calling forwardClose() on an
+  // already-closed connection asserts inside EIPScanner, so skip it and
+  // report the early closure instead of crashing.
+  bool closedEarly = !connectionManager.hasOpenConnections();
+  if (!closedEarly) {
+    connectionManager.forwardClose(si, io);
+  } else {
+    std::fprintf(stderr,
+        "connection closed early by EIPScanner's own inactivity watchdog "
+        "-- requested_rpi_us=%u is likely below the adapter's sustainable "
+        "floor (skipping forwardClose on an already-dead connection)\n",
+        rpiUs);
+  }
 
   if (g_rttMs.empty()) {
-    std::printf("target=%s rpi_us=%u duration_s=%.1f received=0 (no data received)\n",
-                targetIp.c_str(), rpiUs, durationS);
+    std::printf("target=%s rpi_us=%u duration_s=%.1f closed_early=%s received=0 (no data received)\n",
+                targetIp.c_str(), rpiUs, durationS, closedEarly ? "true" : "false");
     return 0;
   }
 
@@ -181,7 +197,8 @@ int main(int argc, char **argv) {
   double expectedCycles = actualDurationS * 1e6 / rpiUs;
   double receptionRatioPct = 100.0 * g_received / expectedCycles;
 
-  std::printf("target=%s requested_rpi_us=%u duration_s=%.1f\n", targetIp.c_str(), rpiUs, durationS);
+  std::printf("target=%s requested_rpi_us=%u duration_s=%.1f closed_early=%s\n",
+              targetIp.c_str(), rpiUs, durationS, closedEarly ? "true" : "false");
   std::printf("cycles_received=%u expected_cycles=%.0f reception_ratio_pct=%.1f achieved_rate_hz=%.2f excluded_startup_frames=%u\n",
               g_received, expectedCycles, receptionRatioPct, achievedRateHz, g_excludedStartup);
   std::printf("rtt_ms: min=%.3f avg=%.3f p50=%.3f p99=%.3f max=%.3f stddev=%.3f\n",
