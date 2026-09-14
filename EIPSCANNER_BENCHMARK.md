@@ -41,6 +41,12 @@ opens a Class 1 exclusive-owner connection to assemblies 151/150/100 and:
    expected cycle count for the requested RPI), achieved cyclic rate, RTT
    percentiles, and cycle-to-cycle jitter.
 
+The source is commented to make every fixed/deterministic element explicit
+and reproducible run to run: the EPath assembly bytes, originator identity,
+NCP flags, RPI units, the 32-byte payload layout, why `kMaxSaneRttMs`
+filters startup artifacts (see below), and the fixed percentile/jitter
+formula definitions used in the results table.
+
 **Caveat on what "RTT" measures**: the benchmark refreshes the O2T payload's
 timestamp continuously (roughly once per millisecond, driven by
 `ConnectionManager::handleConnections()`'s polling loop), but EIPScanner's
@@ -124,3 +130,10 @@ doesn't align perfectly to whole RPI cycles.)
 4. Run: `./examples/benchmark_example <opener_ip> <rpi_us> <duration_s>`,
    e.g. `./examples/benchmark_example 192.168.1.154 10000 8` for a 10 ms RPI,
    8-second run.
+
+## Source
+
+This document and [`BenchmarkExample.cpp`](BenchmarkExample.cpp) are
+tracked in this repo and pushed to
+[`github.com/zwu888/OpENer`](https://github.com/zwu888/OpENer), branch
+`master`.
