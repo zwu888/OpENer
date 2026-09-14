@@ -4,15 +4,7 @@
 // 150 -> 100), so the T2O receive callback can compute round-trip latency
 // using a single (local) monotonic clock -- no cross-host clock sync needed.
 //
-// Usage: benchmark_example <target_ip> <rpi_us> <duration_s> [--io-datapath=socket|dpdk]
-//
-// --io-datapath is a REPORTING LABEL, not a remote control: this is an
-// EIPScanner-side client and has no way to select OpENer's I/O backend over
-// the wire. OpENer's proposed --io-datapath flag (DPDK_IO_DATAPATH_DESIGN.md
-// §5a) is a separate, server-side startup option -- set it there when you
-// start OpENer, then pass the matching value here so the two runs this
-// tool produces (one per backend) are self-labeled in their output, per
-// the parity-check methodology in DPDK_IO_DATAPATH_DESIGN.md §9.
+// Usage: benchmark_example <target_ip> <rpi_us> <duration_s>
 
 #include <cstring>
 #include <cstdint>
@@ -54,29 +46,9 @@ constexpr double kMaxSaneRttMs = 2000.0;
 int main(int argc, char **argv) {
   Logger::setLogLevel(LogLevel::ERROR);
 
-  // --io-datapath=<value> may appear anywhere; everything else is
-  // positional (target_ip, rpi_us, duration_s), in order, same as before.
-  std::string ioDatapath = "socket";
-  std::vector<std::string> positional;
-  for (int i = 1; i < argc; i++) {
-    std::string arg = argv[i];
-    constexpr char kFlag[] = "--io-datapath=";
-    if (arg.rfind(kFlag, 0) == 0) {
-      ioDatapath = arg.substr(sizeof(kFlag) - 1);
-    } else {
-      positional.push_back(arg);
-    }
-  }
-  if (ioDatapath != "socket" && ioDatapath != "dpdk") {
-    std::fprintf(stderr,
-        "warning: --io-datapath=%s is not \"socket\" or \"dpdk\" -- this "
-        "tool only records it as a label, so any value is accepted, but "
-        "check for a typo if that wasn't intended\n", ioDatapath.c_str());
-  }
-
-  std::string targetIp = positional.size() > 0 ? positional[0] : "192.168.1.154";
-  uint32_t rpiUs = positional.size() > 1 ? static_cast<uint32_t>(std::stoul(positional[1])) : 10000;
-  double durationS = positional.size() > 2 ? std::stod(positional[2]) : 10.0;
+  std::string targetIp = argc > 1 ? argv[1] : "192.168.1.154";
+  uint32_t rpiUs = argc > 2 ? static_cast<uint32_t>(std::stoul(argv[2])) : 10000;
+  double durationS = argc > 3 ? std::stod(argv[3]) : 10.0;
 
   auto si = std::make_shared<SessionInfo>(targetIp, 0xAF12);
 
@@ -181,8 +153,8 @@ int main(int argc, char **argv) {
   }
 
   if (g_rttMs.empty()) {
-    std::printf("target=%s rpi_us=%u duration_s=%.1f io_datapath=%s closed_early=%s received=0 (no data received)\n",
-                targetIp.c_str(), rpiUs, durationS, ioDatapath.c_str(), closedEarly ? "true" : "false");
+    std::printf("target=%s rpi_us=%u duration_s=%.1f closed_early=%s received=0 (no data received)\n",
+                targetIp.c_str(), rpiUs, durationS, closedEarly ? "true" : "false");
     return 0;
   }
 
@@ -225,8 +197,8 @@ int main(int argc, char **argv) {
   double expectedCycles = actualDurationS * 1e6 / rpiUs;
   double receptionRatioPct = 100.0 * g_received / expectedCycles;
 
-  std::printf("target=%s requested_rpi_us=%u duration_s=%.1f io_datapath=%s closed_early=%s\n",
-              targetIp.c_str(), rpiUs, durationS, ioDatapath.c_str(), closedEarly ? "true" : "false");
+  std::printf("target=%s requested_rpi_us=%u duration_s=%.1f closed_early=%s\n",
+              targetIp.c_str(), rpiUs, durationS, closedEarly ? "true" : "false");
   std::printf("cycles_received=%u expected_cycles=%.0f reception_ratio_pct=%.1f achieved_rate_hz=%.2f excluded_startup_frames=%u\n",
               g_received, expectedCycles, receptionRatioPct, achievedRateHz, g_excludedStartup);
   std::printf("rtt_ms: min=%.3f avg=%.3f p50=%.3f p99=%.3f max=%.3f stddev=%.3f\n",
