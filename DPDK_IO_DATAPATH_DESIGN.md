@@ -70,6 +70,11 @@ interop/benchmark testing (`EIPSCANNER_TESTING.md`,
 EIPScanner test host "hp6z4" at `192.168.1.151`, both on the same
 `192.168.1.0/24` LAN segment today.
 
+A visual side-by-side of both topologies, the kernel-hop comparison behind
+the jitter-ceiling tradeoff, and a datasheet-style spec comparison is
+published at
+**[I/O Datapath Fork](https://claude.ai/code/artifact/fdab37cd-5ac4-4123-87b0-daec3f8efe63)**.
+
 ### Option B — AF_XDP, single shared NIC (recommended first target)
 
 No topology change from what's tested today — one NIC, one cable, one
