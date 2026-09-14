@@ -69,7 +69,7 @@ active NICs (`eno1`, `enp21s0np0`) intentionally excluded from any binding
 a different PCI function) looked idle in `lspci`/`dpdk-devbind.py --status`
 but turned out to not be a usable Ethernet port at all.
 
-### DPDK validation on this hardware
+### DPDK validation on this hardware: Option A (vfio-pci)
 
 Live-tested with `dpdk-testpmd` (not just inferred from `lspci`) to confirm
 the vfio-pci + IOMMU + i40e PMD stack actually works on this box, before
@@ -110,6 +110,66 @@ Net result: the DPDK 24.11 + hugepages + IOMMU + `vfio-pci` + `net_i40e`
 PMD chain on this hardware is confirmed working end-to-end against
 `0000:09:00.2` — a real, tested foundation for implementing Option A, not
 just an assumption from `lspci` output.
+
+### DPDK validation on this hardware: Option B (AF_XDP)
+
+Also live-tested — this is the more important validation, since Option B
+is the recommended first target (§2). Unlike Option A, this does **not**
+need `vfio-pci` or any unbind at all: DPDK's `net_af_xdp` PMD attaches to
+a NIC that's still sitting on its normal kernel driver, which is the whole
+point of Option B (§3's "How TCP and I/O traffic share one NIC").
+
+Used the same already-proven-idle `enp9s0f2np2` (`0000:09:00.2`) as the
+target, left on `i40e` the entire time — deliberately choosing a device
+that could stay kernel-owned throughout rather than risking `eno1` (this
+host's actual default route: `default via 192.168.1.1 dev eno1`, carrying
+SSH, `git push`, and the `192.168.1.154` address EIPScanner has been
+testing OpENer against all session).
+
+1. **First attempt failed on a kvarg name, not the mechanism.**
+   `dpdk-testpmd --vdev=net_af_xdp0,iface=enp9s0f2np2,queue=0` reported
+   `NET_AF_XDP: rte_pmd_af_xdp_probe(): Invalid kvargs key` — this DPDK
+   24.11 build's `net_af_xdp` PMD uses `start_queue`, not `queue`
+   (confirmed by grepping the valid kvargs strings out of
+   `librte_net_af_xdp.so.25`).
+2. **With the correct kvarg, it worked.**
+   `--vdev=net_af_xdp0,iface=enp9s0f2np2,start_queue=0` initialized
+   cleanly: `Device name: net_af_xdp0`, `Driver name: net_af_xdp`,
+   `Devargs: iface=enp9s0f2np2,start_queue=0`. `libbpf` logged a few
+   benign `skipping unrecognized data section .xdp_run_config` /
+   `xdp_metadata` warnings (newer BTF/XDP ELF sections this libbpf build
+   doesn't fully parse) but the XDP program still loaded and the port came
+   up regardless.
+3. **The NIC never left the kernel driver.** `dpdk-devbind.py --status`
+   after the test still showed `0000:09:00.2` under "Network devices using
+   kernel driver", `drv=i40e` — exactly the point of AF_XDP versus
+   `vfio-pci`. `eno1` and `enp21s0np0` were never touched.
+4. **One caveat worth flagging**: the AF_XDP port reported
+   `Link status: up, Link speed: 10 Gbps`, even though the physical
+   interface has no cable plugged in (`NO-CARRIER` at the kernel level,
+   confirmed both before and after). The `net_af_xdp` PMD doesn't query
+   real hardware link state the way a PCI-bound PMD does — it reports a
+   simplified/default value. Don't trust `net_af_xdp`'s own link-status
+   report as a real carrier check; check the underlying kernel interface
+   (`ip link show`) instead.
+5. **Reported capabilities were visibly smaller than the vfio-pci case**:
+   `Max possible RX/TX queues: 1` (vs. 192 for the bound PCI port) and
+   `No RSS offload flow type is supported` — expected, since AF_XDP shares
+   the NIC with the kernel and doesn't get direct hardware RSS/queue
+   control the way exclusive PMD ownership does. Consistent with §2's
+   "lower ceiling than a fully dedicated PMD" tradeoff being real, not just
+   theoretical.
+6. **Cleanup needed one extra step**: `testpmd` left the interface in
+   `PROMISC` mode after `quit` (`ip link set enp9s0f2np2 promisc off` to
+   clear it) — `vfio-pci`-bound testing didn't leave this residue since
+   unbinding resets the device state, but AF_XDP testing against a
+   kernel-owned NIC does.
+
+Net result: the AF_XDP → `net_af_xdp` PMD path Option B depends on is
+confirmed working on this hardware's `i40e` driver, without ever unbinding
+the NIC from the kernel — the core mechanical claim behind "TCP and DPDK
+coexist on one NIC" in §3 is now a tested fact on this box, not just a
+description of how AF_XDP is supposed to work.
 
 ### Is Option B the best option?
 
