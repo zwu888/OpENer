@@ -108,6 +108,84 @@ current all-socket build — this is what makes Option B deployable on the
 same single-NIC box already in use for interop testing, with no cabling or
 switch-port changes.
 
+#### How TCP and I/O traffic share one NIC under Option B
+
+This is not DPDK taking ownership of the NIC the way Option A's `vfio-pci`
+binding does. The NIC stays bound to its normal kernel driver (`i40e` for
+the X722, `mlx5_core` for the ConnectX-4) the entire time. What changes is
+a small eBPF/XDP program loaded into that driver's RX hook, which decides
+per-packet which of two paths a frame takes — *before* the kernel's normal
+IP stack ever sees it:
+
+```
+                    NIC (kernel driver, e.g. i40e), unchanged
+                              │
+                    RX ring, XDP hook (native driver mode)
+                              │
+              ┌────────────────────────────────────┐
+              │  XDP program (eBPF, loaded once):    │
+              │    if (udp && dst_port == 2222)      │
+              │        → bpf_redirect_map(XSKMAP)    │  → AF_XDP socket → net_af_xdp
+              │    else                              │     PMD → dpdk_io_datapath.c
+              │        → XDP_PASS                    │
+              └────────────────────────────────────┘
+                     │                    │
+        (everything else:          (only UDP:2222,
+         TCP:44818, ARP,            Class 0/1 I/O)
+         ICMP, UDP:44818
+         discovery, SSH)
+                     │
+       normal kernel network stack, unchanged
+       (generic_networkhandler.c's select() loop,
+        CheckAndHandleTcpListenerSocket, etc.)
+```
+
+Key mechanics:
+
+- **`XDP_PASS` is the default and does nothing special** — a frame that
+  doesn't match the filter continues exactly as it does on a plain kernel
+  build today. `CheckAndHandleTcpListenerSocket`, `HandleDataOnTcpSocket`,
+  `CheckAndHandleUdpUnicastSocket` (discovery) all keep working unmodified
+  because their packets simply never enter the redirect branch.
+- **`XDP_REDIRECT` diverts the frame at the driver level**, before
+  `netif_receive_skb()` — the kernel's UDP/IP stack never allocates an
+  `sk_buff` for it or delivers it to a bound socket. This means
+  `CheckAndHandleConsumingUdpSocket()` (today's socket-based UDP:2222
+  reader) simply stops receiving anything once the XDP program is loaded —
+  it becomes dead code under `OPENER_IO_DATAPATH=DPDK`, replaced by a poll
+  into `dpdk_io_datapath.c` (§6) rather than deleted outright, so the
+  SOCKET build path stays untouched.
+- **The AF_XDP socket (`xsk`) is what DPDK's `net_af_xdp` PMD wraps** —
+  `rte_eth_rx_burst`/`tx_burst` in `dpdk_io_datapath.c` (Thread B, §6)
+  operate against this socket's shared-memory rings (`umem`), not against a
+  raw NIC queue. From the CIP-layer code's point of view nothing changes —
+  still just "poll for RX, build a TX mbuf" — but the plumbing underneath
+  is a kernel-mediated zero-copy socket, not a PMD with hardware DMA rings.
+- **Filter granularity**: the simplest version matches UDP dst-port 2222
+  alone (static). A more correct refinement would only redirect traffic
+  from a source IP with an *active* Class 1 connection — updated into a BPF
+  map by `dpdk_io_datapath.c` on each `ForwardOpen`/`ForwardClose` — so a
+  stray UDP:2222 packet from an unrelated host before any connection exists
+  falls through to `XDP_PASS` instead of vanishing into a redirect with
+  nothing listening on the DPDK side.
+- **TX side is symmetric but separate**: OpENer's TCP responses (explicit
+  messaging) go out via the normal `sendto()`/socket path exactly as today.
+  T2O UDP:2222 packets go out via the AF_XDP socket's TX ring, with
+  `dpdk_io_datapath.c` hand-building the Ethernet/IP/UDP headers itself
+  (§7 — DPDK doesn't do sockets-style send). Both TX paths ultimately hit
+  the same physical NIC TX hardware as two independent software paths — no
+  coordination needed since UDP:2222 and TCP:44818 never contend for the
+  same socket or buffer.
+- **Single L2/L3 identity, no ARP duplication**: one NIC, one kernel-owned
+  IP/MAC — ARP requests get `XDP_PASS`'d and answered by the kernel exactly
+  as today. This is why `dpdk_arp.c` in the proposed module layout (§5) is
+  scoped to Option A only; Option B never needs its own ARP responder.
+- **Driver requirement**: this needs *native* (driver-mode) XDP support,
+  not just generic/SKB-mode XDP, to get the zero-copy AF_XDP path DPDK's
+  PMD expects. Both NICs on this test box qualify — `i40e` (X722) and
+  `mlx5_core` (ConnectX-4) both support native XDP — so this is
+  implementable here without new hardware.
+
 ### Option A — dedicated NIC, separate L2 segment
 
 Requires a genuinely separate NIC (or SR-IOV VF) on **both** ends — the
