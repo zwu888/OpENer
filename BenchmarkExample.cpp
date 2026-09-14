@@ -33,7 +33,14 @@ std::vector<double> g_rttMs;
 std::vector<Clock::time_point> g_arrivals;
 uint32_t g_received = 0;
 uint32_t g_excludedStartup = 0;
-constexpr double kMaxSaneRttMs = 2000.0;  // filters pre-init zero-payload echoes
+// Fixed threshold, not derived from any RPI in this run: OpENer echoes one
+// all-zero payload from connection setup before this program's first real
+// timestamp is on the wire, which decodes as an RTT of "now minus
+// steady_clock's epoch" -- typically hours (system uptime), always far
+// above any plausible LAN RTT at the RPIs this benchmark exercises
+// (milliseconds to low hundreds of ms). Anything past this line is that
+// startup artifact, not a slow cycle.
+constexpr double kMaxSaneRttMs = 2000.0;
 }
 
 int main(int argc, char **argv) {
@@ -47,16 +54,24 @@ int main(int argc, char **argv) {
 
   ConnectionManager connectionManager;
   ConnectionParameters parameters;
+  // EPath: class 0x04 (Assembly), config instance 151, O2T instance 150,
+  // T2O instance 100 -- fixed by OpENer's POSIX sample app
+  // (DEMO_APP_{CONFIG,OUTPUT,INPUT}_ASSEMBLY_NUM), not scanner-chosen.
   parameters.connectionPath = {0x20, 0x04, 0x24, 151, 0x2C, 150, 0x2C, 100};
   parameters.o2tRealTimeFormat = true;
+  // Arbitrary but fixed originator identity -- deterministic across runs so
+  // repeated benchmark invocations are directly comparable in adapter logs.
   parameters.originatorVendorId = 342;
   parameters.originatorSerialNumber = 0x12345;
+  // Both directions: Point-to-Point (not multicast) + scheduled priority,
+  // with a fixed 32-byte payload size matching the sample app's assemblies.
   parameters.t2oNetworkConnectionParams |= NetworkConnectionParams::P2P;
   parameters.t2oNetworkConnectionParams |= NetworkConnectionParams::SCHEDULED_PRIORITY;
   parameters.t2oNetworkConnectionParams |= 32;
   parameters.o2tNetworkConnectionParams |= NetworkConnectionParams::P2P;
   parameters.o2tNetworkConnectionParams |= NetworkConnectionParams::SCHEDULED_PRIORITY;
   parameters.o2tNetworkConnectionParams |= 32;
+  // RPI is in microseconds on the wire; this is the sole benchmark variable.
   parameters.o2tRPI = rpiUs;
   parameters.t2oRPI = rpiUs;
   parameters.transportTypeTrigger |= NetworkConnectionParams::CLASS1;
@@ -68,6 +83,10 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // Fixed 32-byte payload layout, deterministic across every run:
+  //   bytes [0, 8)  -- send-time steady_clock timestamp, nanoseconds
+  //   bytes [8, 12) -- monotonically increasing sequence number
+  //   bytes [12,32) -- zero padding, unused
   uint32_t seq = 0;
   auto makePayload = [&seq]() {
     std::vector<uint8_t> payload(32, 0);
@@ -78,9 +97,12 @@ int main(int argc, char **argv) {
     return payload;
   };
 
+  // Single-threaded callback: EIPScanner invokes this synchronously from
+  // inside connectionManager.handleConnections() below, on the same thread
+  // -- no locking needed around the g_* accumulators.
   ptr->setReceiveDataListener([](auto /*header*/, auto /*seqCount*/, const std::vector<uint8_t> &data) {
     auto now = Clock::now();
-    if (data.size() < 12) return;
+    if (data.size() < 12) return;  // short/malformed frame, ignore
     uint64_t sentNs;
     std::memcpy(&sentNs, data.data(), 8);
     uint64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
@@ -102,6 +124,12 @@ int main(int argc, char **argv) {
   auto deadline = start + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(durationS));
 
   while (connectionManager.hasOpenConnections() && Clock::now() < deadline) {
+    // Refresh the payload every loop iteration (~1ms cadence, set by the
+    // handleConnections() timeout below) so the timestamp embedded at
+    // actual transmit time is always as fresh as possible. IOConnection
+    // only transmits once per RPI window internally, so the measured RTT
+    // is end-to-end data-freshness latency (transmit-scheduling delay +
+    // true network RTT), not raw wire latency -- see EIPSCANNER_BENCHMARK.md.
     ptr->setDataToSend(makePayload());
     connectionManager.handleConnections(std::chrono::milliseconds(1));
   }
@@ -114,6 +142,9 @@ int main(int argc, char **argv) {
     return 0;
   }
 
+  // Nearest-rank percentiles (index = size * p / 100, clamped) -- a fixed,
+  // deterministic definition so results are directly comparable run to run
+  // without depending on an interpolation method.
   std::vector<double> sorted = g_rttMs;
   std::sort(sorted.begin(), sorted.end());
   double sum = 0;
@@ -128,6 +159,9 @@ int main(int argc, char **argv) {
   for (double v : sorted) sqSum += (v - avg) * (v - avg);
   double stddev = std::sqrt(sqSum / sorted.size());
 
+  // Jitter here is mean absolute difference between consecutive cycle
+  // intervals (RFC 3550-style, not stddev) -- a fixed formula so this
+  // number means the same thing across every RPI tested.
   std::vector<double> intervalsMs;
   for (size_t i = 1; i < g_arrivals.size(); i++) {
     intervalsMs.push_back(std::chrono::duration<double, std::milli>(g_arrivals[i] - g_arrivals[i - 1]).count());
