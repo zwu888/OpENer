@@ -62,6 +62,32 @@ no kernel driver bound) usable for Option A experiments, and its active
 NICs (`eno1`, `enp21s0np0`) intentionally excluded from any binding — the
 box's own network access depends on them.
 
+### Is Option B the best option?
+
+For the stated goal — deployability across typical single-NIC adapter
+hardware while cutting cyclic-I/O jitter — yes: Option B needs no extra
+hardware, works on the exact single-NIC setup already tested here, and
+avoids reimplementing ARP/routing that Option A would force onto the
+application. That's the full reasoning behind the recommendation above.
+
+But "best" depends on which goal is actually being optimized:
+
+- **Option B is the pragmatic best option for most real deployments.** It
+  matches how OpENer's sample app is actually used today (one NIC, one
+  identity) and ships without any hardware change.
+- **Option A is the best option only if the goal is the lowest achievable
+  jitter ceiling specifically**, and a spare NIC/VF already exists on
+  *both* ends of the link. Its exclusive PMD ownership crosses zero kernel
+  hops per I/O packet (see the "I/O Datapath Fork" comparison above), which
+  Option B — still crossing into the kernel once for the XDP redirect —
+  structurally cannot match.
+
+Nothing in this design's current scope (a single-NIC adapter, tested
+against a single-NIC scanner host) calls for that extreme, so the
+recommendation stands: **Option B first**, with Option A staying a
+drop-in alternative for a deployment that specifically has the spare
+hardware and needs the absolute floor.
+
 ## 3. Network topology
 
 Concrete topology for both options, using the hosts already in play for
