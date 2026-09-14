@@ -61,10 +61,55 @@ alternative later for users who do have a spare NIC/VF and want the
 absolute lowest jitter.
 
 This machine (used for interop testing in `EIPSCANNER_TESTING.md`) has
-DPDK 24.11 + hugepages already configured, an idle NIC (`0000:09:00.0`,
-no kernel driver bound) usable for Option A experiments, and its active
-NICs (`eno1`, `enp21s0np0`) intentionally excluded from any binding — the
-box's own network access depends on them.
+DPDK 24.11 + hugepages already configured, an idle NIC (`0000:09:00.2`,
+`enp9s0f2np2`, no cable/carrier) usable for Option A experiments, and its
+active NICs (`eno1`, `enp21s0np0`) intentionally excluded from any binding
+— the box's own network access depends on them. **Validated live** — see
+"DPDK validation on this hardware" below; `0000:09:00.0` (same X722 chip,
+a different PCI function) looked idle in `lspci`/`dpdk-devbind.py --status`
+but turned out to not be a usable Ethernet port at all.
+
+### DPDK validation on this hardware
+
+Live-tested with `dpdk-testpmd` (not just inferred from `lspci`) to confirm
+the vfio-pci + IOMMU + i40e PMD stack actually works on this box, before
+trusting it as a candidate for Option A:
+
+1. **`0000:09:00.0` doesn't work — for either driver.** It showed as idle
+   in `dpdk-devbind.py --status` (no driver, "Other Network devices"), so
+   it looked like a free port. Binding it to `vfio-pci` succeeded at the
+   sysfs level, but `dpdk-testpmd -a 0000:09:00.0` reported
+   `No probed ethernet devices` even at max log verbosity — no PMD ever
+   claims it. The fact that Linux's own `i40e` driver never claimed it
+   either (it was never even under "Network devices using kernel driver")
+   was the real tell: this is a non-LAN companion PCI function of the X722
+   chip (X722 exposes multiple functions per physical die, not all of them
+   netdevs), not a second port. Restored to its original unbound state.
+2. **`0000:09:00.2` (`enp9s0f2np2`) is the real idle X722 port.** Confirmed
+   `NO-CARRIER`, `state DOWN`, no IP before touching it. Bound to
+   `vfio-pci`, then `dpdk-testpmd -b 0000:15:00.0 -i` (blocklisting the
+   ConnectX-4 so EAL couldn't grab it instead — see next point)
+   successfully initialized it: driver `net_i40e`, firmware
+   `4.11 0x8000226e`, full RSS/VMDq/queue-count capabilities reported,
+   `Link status: down` (correct — no cable plugged in). Restored to `i40e`
+   (kernel) afterward; `eno1` and `enp21s0np0` confirmed unaffected
+   throughout.
+3. **A no-filter `testpmd` run auto-probed the wrong NIC.** Without an
+   explicit `-a`/`-b` filter, EAL auto-attached to `0000:15:00.0` — the
+   *active* ConnectX-4 (`enp21s0np0`, `192.168.100.1`) — via its
+   **bifurcated** `mlx5_pci` PMD, which (unlike `vfio-pci`) doesn't require
+   unbinding from the kernel driver first. It released cleanly on `quit`
+   and the interface came back with its IP and connectivity intact
+   (verified by ping), but this is a live reminder that mlx5-class NICs
+   are one autoprobe away from being grabbed even while "just" running
+   `dpdk-testpmd -i` with no explicit target — always pass an explicit
+   `-a`/`-b` filter when validating a *different* device on a box that
+   also has an active mlx5 NIC.
+
+Net result: the DPDK 24.11 + hugepages + IOMMU + `vfio-pci` + `net_i40e`
+PMD chain on this hardware is confirmed working end-to-end against
+`0000:09:00.2` — a real, tested foundation for implementing Option A, not
+just an assumption from `lspci` output.
 
 ### Is Option B the best option?
 
@@ -239,18 +284,19 @@ DPDK-bound NIC no longer speaks ARP or answers on any other protocol:
 │ (kernel: TCP:44818,         │              └────────────────────────┘
 │  UDP:44818, SSH, ARP, ICMP) │
 └──┬──────────────────────────┘
-   │  second, otherwise-idle NIC — no kernel driver bound
+   │  second, otherwise-idle NIC — kernel-bound, no cable/carrier
 ┌──┴──────────────────────┐     dedicated I/O-only L2 segment      ┌────────────────────────┐
-│ 0000:09:00.0 (X722)       │ ════════════════════════════════════▶│ Scanner/PLC I/O NIC      │
-│ DPDK PMD (vfio-pci)        │   direct cable, or its own switch/    │ (separate port from its   │
-│ dpdk_io_datapath.c          │   VLAN — UDP :2222 only, no ARP/       │  own management NIC)      │
-│ (Thread B, isolated core)    │   DHCP/SSH needed on this segment      │                           │
+│ 0000:09:00.2 (X722)       │ ════════════════════════════════════▶│ Scanner/PLC I/O NIC      │
+│ enp9s0f2np2 → DPDK PMD      │   direct cable, or its own switch/    │ (separate port from its   │
+│ (vfio-pci) → dpdk_io_data-   │   VLAN — UDP :2222 only, no ARP/       │  own management NIC)      │
+│ path.c (Thread B, isolated    │   DHCP/SSH needed on this segment      │                           │
+│ core)                          │                                        │                           │
 └────────────────────────────┘                                    └────────────────────────┘
 ```
 
-On this test machine, `0000:09:00.0` (an idle Intel X722 port, confirmed
-unbound via `dpdk-devbind.py --status`) is the concrete candidate for this
-role — see §2. Note this option isn't testable against hp6z4 as configured
+On this test machine, `0000:09:00.2` (`enp9s0f2np2`, an idle Intel X722
+port — live-tested with `dpdk-testpmd`, see §2) is the concrete candidate
+for this role. Note this option isn't testable against hp6z4 as configured
 today, since hp6z4 only has its single management NIC on the shared LAN; it
 would need its own second, DPDK- or otherwise dedicated-port to become a
 real Option-A peer.
